@@ -10,7 +10,7 @@ import "contracts/libraries/math/CryptoLibrary.sol";
 import "contracts/libraries/snapshots/SnapshotsStorage.sol";
 import "contracts/utils/DeterministicAddress.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import {SnapshotsErrorCodes} from "contracts/libraries/errorCodes/SnapshotsErrorCodes.sol";
+import "contracts/libraries/errors/SnapshotsErrors.sol";
 
 /// @custom:salt Snapshots
 /// @custom:deploy-type deployUpgradeable
@@ -64,10 +64,8 @@ contract Snapshots is Initializable, SnapshotsStorage, ISnapshots {
             string(abi.encodePacked(SnapshotsErrorCodes.SNAPSHOT_CONSENSUS_RUNNING))
         );
 
-        uint256 lastSnapshotCommittedAt = _getLatestSnapshotSafe().committedAt;
-
         require(
-            block.number >= lastSnapshotCommittedAt + _minimumIntervalBetweenSnapshots,
+            block.number >= _snapshots[_epoch].committedAt + _minimumIntervalBetweenSnapshots,
             string(abi.encodePacked(SnapshotsErrorCodes.SNAPSHOT_MIN_BLOCKS_INTERVAL_NOT_PASSED))
         );
 
@@ -77,34 +75,40 @@ contract Snapshots is Initializable, SnapshotsStorage, ISnapshots {
             (uint256[4] memory masterPublicKey, uint256[2] memory signature) = RCertParserLibrary
                 .extractSigGroup(groupSignature_, 0);
 
-            require(
-                keccak256(abi.encodePacked(masterPublicKey)) ==
-                    IETHDKG(_ethdkgAddress()).getMasterPublicKeyHash(),
-                string(abi.encodePacked(SnapshotsErrorCodes.SNAPSHOT_WRONG_MASTER_PUBLIC_KEY))
-            );
+            bytes32 calculatedMasterPublicKeyHash = keccak256(abi.encodePacked(masterPublicKey));
+            bytes32 expectedMasterPublicKeyHash = IETHDKG(_ethdkgAddress())
+                .getMasterPublicKeyHash();
 
-            require(
-                CryptoLibrary.verifySignatureASM(
+            if (calculatedMasterPublicKeyHash != expectedMasterPublicKeyHash) {
+                revert SnapshotsErrors.InvalidMasterPublicKey(
+                    calculatedMasterPublicKeyHash,
+                    expectedMasterPublicKeyHash
+                );
+            }
+
+            if (
+                !CryptoLibrary.verifySignatureASM(
                     abi.encodePacked(keccak256(bClaims_)),
                     signature,
                     masterPublicKey
-                ),
-                string(abi.encodePacked(SnapshotsErrorCodes.SNAPSHOT_SIGNATURE_VERIFICATION_FAILED))
-            );
+                )
+            ) {
+                revert SnapshotsErrors.SignatureVerificationFailed();
+            }
         }
 
         BClaimsParserLibrary.BClaims memory blockClaims = BClaimsParserLibrary.extractBClaims(
             bClaims_
         );
+
         require(
             epoch * _epochLength == blockClaims.height,
             string(abi.encodePacked(SnapshotsErrorCodes.SNAPSHOT_INCORRECT_BLOCK_HEIGHT))
         );
 
-        require(
-            blockClaims.chainId == _chainId,
-            string(abi.encodePacked(SnapshotsErrorCodes.SNAPSHOT_INCORRECT_CHAIN_ID))
-        );
+        if (blockClaims.chainId != _chainId) {
+            revert SnapshotsErrors.InvalidChainId(blockClaims.chainId);
+        }
 
         {
             // Check if sender is the elected validator allowed to make the snapshot
@@ -163,7 +167,7 @@ contract Snapshots is Initializable, SnapshotsStorage, ISnapshots {
         Epoch storage epochReg = _epochRegister();
         {
             require(
-                epochReg.get() == 0,
+                _epoch == 0,
                 string(abi.encodePacked(SnapshotsErrorCodes.SNAPSHOT_MIGRATION_NOT_ALLOWED))
             );
             require(
@@ -177,10 +181,9 @@ contract Snapshots is Initializable, SnapshotsStorage, ISnapshots {
             BClaimsParserLibrary.BClaims memory blockClaims = BClaimsParserLibrary.extractBClaims(
                 bClaims_[i]
             );
-            require(
-                blockClaims.height % _epochLength == 0,
-                string(abi.encodePacked(SnapshotsErrorCodes.SNAPSHOT_INCORRECT_BLOCK_HEIGHT))
-            );
+            if (blockClaims.height % _epochLength != 0) {
+                revert SnapshotsErrors.InvalidBlockHeight(blockClaims.height);
+            }
             epoch = getEpochFromHeight(blockClaims.height);
             _setSnapshot(Snapshot(block.number, blockClaims));
             emit SnapshotTaken(
@@ -222,11 +225,11 @@ contract Snapshots is Initializable, SnapshotsStorage, ISnapshots {
     }
 
     function getChainIdFromSnapshot(uint256 epoch_) public view returns (uint256) {
-        return getSnapshot(epoch_).blockClaims.chainId;
+        return _snapshots[epoch_].blockClaims.chainId;
     }
 
     function getChainIdFromLatestSnapshot() public view returns (uint256) {
-        return _getLatestSnapshotSafe().blockClaims.chainId;
+        return _snapshots[_epoch].blockClaims.chainId;
     }
 
     function getBlockClaimsFromSnapshot(uint256 epoch_)
@@ -234,7 +237,7 @@ contract Snapshots is Initializable, SnapshotsStorage, ISnapshots {
         view
         returns (BClaimsParserLibrary.BClaims memory)
     {
-        return getSnapshot(epoch_).blockClaims;
+        return _snapshots[epoch_].blockClaims;
     }
 
     function getBlockClaimsFromLatestSnapshot()
@@ -242,7 +245,7 @@ contract Snapshots is Initializable, SnapshotsStorage, ISnapshots {
         view
         returns (BClaimsParserLibrary.BClaims memory)
     {
-        return _getLatestSnapshotSafe().blockClaims;
+        return _snapshots[_epoch].blockClaims;
     }
 
     function getCommittedHeightFromSnapshot(uint256 epoch_) public view returns (uint256) {
@@ -268,11 +271,17 @@ contract Snapshots is Initializable, SnapshotsStorage, ISnapshots {
     }
 
     function getLatestSnapshot() public view returns (Snapshot memory) {
-        return _getLatestSnapshotSafe();
+        return _snapshots[_epoch];
     }
 
     function getEpochFromHeight(uint256 height) public view returns (uint256) {
-        return _getEpochFromHeight(uint32(height));
+        if (height <= _epochLength) {
+            return 1;
+        }
+        if (height % _epochLength == 0) {
+            return height / _epochLength;
+        }
+        return (height / _epochLength) + 1;
     }
 
     function mayValidatorSnapshot(
